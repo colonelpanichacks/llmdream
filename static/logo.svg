@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Dark background -->
+  <rect width="128" height="128" fill="#0d1117" rx="16"/>
+  <rect x="2" y="2" width="124" height="124" fill="none" stroke="#9b30ff" stroke-width="1" rx="14" opacity="0.25"/>
+
+  <!-- LLM - big, prominent, top -->
+  <text x="64" y="28" text-anchor="middle" font-family="monospace, 'Courier New'" font-size="24" font-weight="bold" fill="#bd00ff" letter-spacing="8">LLM</text>
+
+  <!-- Space invader alien - scaled up, centered -->
+  <g transform="translate(31, 34) scale(6)">
+    <!-- Row 0 -->
+    <rect x="2" y="0" width="1" height="1" fill="#9b30ff"/>
+    <rect x="8" y="0" width="1" height="1" fill="#9b30ff"/>
+    <!-- Row 1 -->
+    <rect x="3" y="1" width="1" height="1" fill="#7b68ee"/>
+    <rect x="7" y="1" width="1" height="1" fill="#7b68ee"/>
+    <!-- Row 2 -->
+    <rect x="2" y="2" width="7" height="1" fill="#6a5acd"/>
+    <!-- Row 3: eyes -->
+    <rect x="1" y="3" width="2" height="1" fill="#5b4fcf"/>
+    <rect x="4" y="3" width="3" height="1" fill="#5b4fcf"/>
+    <rect x="8" y="3" width="2" height="1" fill="#5b4fcf"/>
+    <rect x="3" y="3" width="1" height="1" fill="#00d4ff"/>
+    <rect x="7" y="3" width="1" height="1" fill="#00d4ff"/>
+    <!-- Row 4 -->
+    <rect x="0" y="4" width="11" height="1" fill="#6a5acd"/>
+    <!-- Row 5 -->
+    <rect x="0" y="5" width="1" height="1" fill="#bd00ff"/>
+    <rect x="2" y="5" width="7" height="1" fill="#7b68ee"/>
+    <rect x="10" y="5" width="1" height="1" fill="#bd00ff"/>
+    <!-- Row 6 -->
+    <rect x="0" y="6" width="1" height="1" fill="#bd00ff"/>
+    <rect x="2" y="6" width="1" height="1" fill="#9b30ff"/>
+    <rect x="8" y="6" width="1" height="1" fill="#9b30ff"/>
+    <rect x="10" y="6" width="1" height="1" fill="#bd00ff"/>
+    <!-- Row 7: feet -->
+    <rect x="3" y="7" width="2" height="1" fill="#7b68ee"/>
+    <rect x="6" y="7" width="2" height="1" fill="#7b68ee"/>
+  </g>
+
+  <!-- DREAM - big, prominent, bottom -->
+  <text x="64" y="120" text-anchor="middle" font-family="monospace, 'Courier New'" font-size="22" font-weight="bold" fill="#7b68ee" letter-spacing="5">DREAM</text>
+
+  <!-- Accent lines -->
+  <line x1="6" y1="34" x2="22" y2="34" stroke="#bd00ff" stroke-width="1" opacity="0.3"/>
+  <line x1="106" y1="34" x2="122" y2="34" stroke="#bd00ff" stroke-width="1" opacity="0.3"/>
+  <line x1="6" y1="108" x2="22" y2="108" stroke="#7b68ee" stroke-width="1" opacity="0.3"/>
+  <line x1="106" y1="108" x2="122" y2="108" stroke="#7b68ee" stroke-width="1" opacity="0.3"/>
+</svg>

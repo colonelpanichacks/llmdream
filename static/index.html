@@ -3,11 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1">
-    <title>LLM Dream 👾</title>
-    <link rel="stylesheet" href="/static/style.css?v=11">
+    <title>LLM Dream</title>
+    <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+    <link rel="stylesheet" href="/static/style.css?v=12">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
@@ -20,15 +23,12 @@
     <!-- Sidebar -->
     <aside id="sidebar">
         <div class="sidebar-header">
-            <h2>LLM Dream 👾</h2>
+            <h2><img src="/static/logo.svg" alt="" class="sidebar-logo">LLM Dream</h2>
             <div class="header-actions">
                 <button id="settings-btn" onclick="openSettings()" title="Settings">&#9881;</button>
                 <button id="sidebar-close" onclick="toggleSidebar()">&times;</button>
             </div>
         </div>
-
-        <!-- Kill Button -->
-        <button id="kill-btn" onclick="sendKill()">KILL ALL</button>
 
         <!-- New Session -->
         <button id="new-session-btn" onclick="createSession()">+ New Session</button>
@@ -50,6 +50,7 @@
             </div>
             <div id="active-models-list"></div>
             <textarea id="auto-chat-prompt" class="auto-chat-prompt-sidebar" placeholder="Initial prompt (optional)..." rows="2"></textarea>
+            <button id="kill-btn" onclick="sendKill()">KILL ALL</button>
         </div>
     </aside>
 
@@ -161,6 +162,21 @@
                     </div>
                 </div>
                 <p class="settings-hint">Time between auto-injected story stages. Use multi-line prompts to define stages.</p>
+                <div class="toggle-row" style="margin-top:8px">
+                    <span class="toggle-label">Auto-stop timer</span>
+                    <label class="toggle-switch"><input type="checkbox" id="auto-kill-toggle" onchange="toggleAutoKill()"><span class="toggle-slider"></span></label>
+                </div>
+                <div id="auto-kill-settings" style="display:none">
+                    <div class="settings-row">
+                        <label>Stop after</label>
+                        <div class="slider-group">
+                            <input type="range" id="auto-kill-duration" min="1" max="120" step="1" value="30" oninput="updateAutoKillDuration(this)">
+                            <input type="number" id="auto-kill-num" class="settings-num-input" min="1" max="720" step="1" value="30" onchange="setAutoKillNum(this)">
+                            <span class="slider-value" id="auto-kill-val">min</span>
+                        </div>
+                    </div>
+                    <p class="settings-hint">Auto-chat will stop after this duration from the last prompt.</p>
+                </div>
             </div>
 
             <!-- Preferences -->
@@ -185,12 +201,144 @@
     <!-- Main Chat -->
     <main id="chat-area">
         <div id="messages"></div>
+        <div id="stages-schedule-pinned" class="stages-schedule-pinned" style="display:none"></div>
         <div id="input-bar">
             <textarea id="user-input" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+            <button id="stage-builder-btn" onclick="openStageBuilder()" title="Stage Builder"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button>
             <button id="send-btn" onclick="sendMessage()">Send</button>
         </div>
     </main>
 
-    <script src="/static/app.js?v=11"></script>
+    <!-- Stage Builder Modal -->
+    <div id="stage-builder-modal" class="export-modal-overlay" onclick="if(event.target===this)closeStageBuilder()">
+        <div class="export-modal" style="width:500px">
+            <div class="export-modal-header">
+                <h3>Stage Builder</h3>
+                <button class="settings-close" onclick="closeStageBuilder()">&times;</button>
+            </div>
+            <div class="export-modal-body">
+                <div id="stage-builder-list" class="stage-builder-list"></div>
+                <button class="btn-sm" onclick="addBuilderStage()" style="width:100%">+ Add Stage</button>
+                <div class="sb-time-fields">
+                    <div class="sb-time-group">
+                        <label class="export-option-label">Stage Interval</label>
+                        <div class="time-spinner-row">
+                            <div class="time-spinner">
+                                <button class="time-spin-btn" onclick="spinTime('sb-int-hr',1,0,23)">&#9650;</button>
+                                <input type="number" id="sb-int-hr" class="time-spin-input" value="0" min="0" max="23">
+                                <button class="time-spin-btn" onclick="spinTime('sb-int-hr',-1,0,23)">&#9660;</button>
+                                <span class="time-spin-label">hr</span>
+                            </div>
+                            <span class="time-spinner-sep">:</span>
+                            <div class="time-spinner">
+                                <button class="time-spin-btn" onclick="spinTime('sb-int-min',1,0,59)">&#9650;</button>
+                                <input type="number" id="sb-int-min" class="time-spin-input" value="2" min="0" max="59">
+                                <button class="time-spin-btn" onclick="spinTime('sb-int-min',-1,0,59)">&#9660;</button>
+                                <span class="time-spin-label">min</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="sb-time-group">
+                        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                            <label class="export-option-label" style="margin:0">Auto-kill</label>
+                            <label class="toggle-switch" style="transform:scale(0.8)"><input type="checkbox" id="sb-auto-kill" checked><span class="toggle-slider"></span></label>
+                        </div>
+                        <div class="time-spinner-row" id="sb-kill-row">
+                            <div class="time-spinner">
+                                <button class="time-spin-btn" onclick="spinTime('sb-kill-hr',1,0,23)">&#9650;</button>
+                                <input type="number" id="sb-kill-hr" class="time-spin-input" value="0" min="0" max="23">
+                                <button class="time-spin-btn" onclick="spinTime('sb-kill-hr',-1,0,23)">&#9660;</button>
+                                <span class="time-spin-label">hr</span>
+                            </div>
+                            <span class="time-spinner-sep">:</span>
+                            <div class="time-spinner">
+                                <button class="time-spin-btn" onclick="spinTime('sb-kill-min',1,0,59)">&#9650;</button>
+                                <input type="number" id="sb-kill-min" class="time-spin-input" value="30" min="0" max="59">
+                                <button class="time-spin-btn" onclick="spinTime('sb-kill-min',-1,0,59)">&#9660;</button>
+                                <span class="time-spin-label">min</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="export-modal-footer">
+                <button class="btn-primary" onclick="startStageBuilder()">Start</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Options Modal -->
+    <div id="export-modal" class="export-modal-overlay" onclick="if(event.target===this)closeExportModal()">
+        <div class="export-modal">
+            <div class="export-modal-header">
+                <h3 id="export-modal-title">Export</h3>
+                <button class="settings-close" onclick="closeExportModal()">&times;</button>
+            </div>
+            <div class="export-modal-body">
+                <div class="export-option-group">
+                    <label class="export-option-label">Template</label>
+                    <div class="export-templates" id="export-templates"></div>
+                </div>
+                <div class="export-option-group">
+                    <label class="export-option-label">Title &amp; Subtitle</label>
+                    <input type="text" id="export-custom-title" placeholder="Custom title (leave blank for session title)">
+                    <input type="text" id="export-custom-subtitle" placeholder="Custom subtitle (optional)">
+                    <div class="toggle-row">
+                        <span class="toggle-label">Use prompt as title</span>
+                        <label class="toggle-switch"><input type="checkbox" id="export-prompt-title"><span class="toggle-slider"></span></label>
+                    </div>
+                </div>
+                <div class="export-option-group">
+                    <label class="export-option-label">Colors</label>
+                    <div class="export-color-row">
+                        <div class="export-color-item">
+                            <label>Accent</label>
+                            <input type="color" id="export-color-accent" value="#00ffc8">
+                        </div>
+                        <div class="export-color-item">
+                            <label>Highlight</label>
+                            <input type="color" id="export-color-highlight" value="#bd00ff">
+                        </div>
+                        <div class="export-color-item">
+                            <label>Background</label>
+                            <input type="color" id="export-color-bg" value="#0a0a0f">
+                        </div>
+                        <div class="export-color-item">
+                            <label>Text</label>
+                            <input type="color" id="export-color-text" value="#d4d4d8">
+                        </div>
+                    </div>
+                </div>
+                <div id="export-storybook-options" style="display:none">
+                    <div class="export-option-group">
+                        <label class="export-option-label">Storybook Options</label>
+                        <div class="toggle-row">
+                            <span class="toggle-label">Image prompt captions</span>
+                            <label class="toggle-switch"><input type="checkbox" id="export-image-captions"><span class="toggle-slider"></span></label>
+                        </div>
+                    </div>
+                </div>
+                <div id="export-flipbook-options" style="display:none">
+                    <div class="export-option-group">
+                        <label class="export-option-label">Flipbook Options</label>
+                        <div class="param-group">
+                            <label>Speed <span id="export-speed-val">6.0</span>s per frame</label>
+                            <input type="range" id="export-speed" min="0" max="100" step="1" value="50" oninput="updateFlipbookSpeed(this)">
+                            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);font-family:'SF Mono','Fira Code',monospace;margin-top:2px"><span>Slow</span><span>Fast</span></div>
+                        </div>
+                        <div class="toggle-row">
+                            <span class="toggle-label">Show text overlay</span>
+                            <label class="toggle-switch"><input type="checkbox" id="export-show-text" checked><span class="toggle-slider"></span></label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="export-modal-footer">
+                <button class="btn-primary" id="export-confirm-btn" onclick="confirmExport()">Export</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=12"></script>
 </body>
 </html>

@@ -163,11 +163,20 @@ function handleMessage(data) {
         case 'auto_chat_status':
             autoChatActive = data.active;
             updateAutoChatButton();
-            if (!data.active) hideStageIndicator();
+            if (!data.active) {
+                hideStageIndicator();
+                if (_autoKillTimer) { clearTimeout(_autoKillTimer); _autoKillTimer = null; }
+            } else {
+                startAutoKillTimer();
+            }
             break;
 
         case 'stage_update':
             showStageIndicator(data.current, data.total, data.text);
+            break;
+
+        case 'stages_schedule':
+            showStagesSchedule(data.stages, data.interval_minutes, data.current);
             break;
 
         case 'killed':
@@ -179,6 +188,9 @@ function handleMessage(data) {
             for (const mid of Object.keys(thinkingElements)) {
                 removeThinking(mid);
             }
+            if (_stagesTimerInterval) { clearInterval(_stagesTimerInterval); _stagesTimerInterval = null; }
+            const pinnedSched = document.getElementById('stages-schedule-pinned');
+            if (pinnedSched) { pinnedSched.style.display = 'none'; pinnedSched.innerHTML = ''; }
             if (data.message) addSystemMessage(data.message);
             break;
 
@@ -260,6 +272,7 @@ function renderSessions(sessions, currentId) {
             <div class="session-menu" id="session-menu-${s.id}">
                 <button onclick="event.stopPropagation();exportSessionStorybook('${s.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg> Storybook</button>
                 <button onclick="event.stopPropagation();exportSessionFlipbook('${s.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg> Flip Book</button>
+                <button onclick="event.stopPropagation();exportSessionPrompts('${s.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> Prompts</button>
             </div>
         `;
 
@@ -442,6 +455,7 @@ function renderActiveModels() {
                 <div class="name">${escapeHtml(cfg.display_name)}</div>
                 <div class="model-id">${escapeHtml(mid)}</div>
             </div>
+            <button class="model-kill-btn" onclick="confirmRemoveModel('${mid}')" title="Remove model">&times;</button>
             <button class="settings-toggle" onclick="toggleModelSettings('${mid}')" title="Expand settings">&#9662;</button>
             <div class="model-settings" id="settings-${CSS.escape(mid)}">
                 <div class="param-group">
@@ -576,10 +590,6 @@ function addModel() {
         return;
     }
 
-    if (Object.keys(activeModels).length >= 4) {
-        addSystemMessage('Maximum 4 models allowed. Remove one first.');
-        return;
-    }
 
     const displayName = document.getElementById('model-display-name').value || modelId.split(':')[0];
     const color = document.getElementById('model-color').value;
@@ -632,7 +642,7 @@ function addModel() {
 function updateModelCount() {
     const count = Object.keys(activeModels).length;
     const el = document.getElementById('model-count-indicator');
-    if (el) el.textContent = `${count}/4 models active`;
+    if (el) el.textContent = `${count} model${count !== 1 ? 's' : ''} active`;
 }
 
 function removeModel(modelId) {
@@ -1215,27 +1225,465 @@ function hideStageIndicator() {
     if (indicator) indicator.style.display = 'none';
 }
 
+// ═══ Stages Schedule Display ═══
+
+let _stagesTimerInterval = null;
+
+function showStagesSchedule(stages, intervalMinutes, currentStage) {
+    // Clear any existing timer
+    if (_stagesTimerInterval) clearInterval(_stagesTimerInterval);
+
+    // Use the pinned container at the bottom of the chat area
+    const scheduleEl = document.getElementById('stages-schedule-pinned');
+    if (!scheduleEl) return;
+    scheduleEl.style.display = '';
+
+    const intervalSec = intervalMinutes * 60;
+    const startTime = Date.now();
+
+    let collapsed = false;
+
+    function render() {
+        const elapsed = (Date.now() - startTime) / 1000;
+        // Auto-hide when all stages are done
+        if (currentStage > stages.length) {
+            scheduleEl.style.display = 'none';
+            scheduleEl.innerHTML = '';
+            if (_stagesTimerInterval) { clearInterval(_stagesTimerInterval); _stagesTimerInterval = null; }
+            return;
+        }
+
+        // Active stage timer
+        const secsUntilNext = Math.max(0, intervalSec - elapsed);
+        const am = Math.floor(secsUntilNext / 60);
+        const as = Math.floor(secsUntilNext % 60);
+        const activeTimer = am > 0 ? `${am}m ${as}s` : `${as}s`;
+
+        // Collapsed: compact one-liner
+        const toggleIcon = collapsed ? '&#9662;' : '&#9652;';
+        let html = `<div class="schedule-header" onclick="_toggleScheduleCollapse()" style="cursor:pointer;margin-bottom:${collapsed ? '0' : '10px'}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Stage ${currentStage}/${stages.length}
+            ${_autoKillEnabled && _autoKillTimer ? '<span style="margin-left:4px;color:rgba(255,45,85,0.5);font-size:8px;">auto-stop on</span>' : ''}
+            <span style="margin-left:auto;color:var(--accent);font-size:10px;">${activeTimer}</span>
+            <span style="margin-left:8px;font-size:12px;-webkit-text-fill-color:var(--text-muted);color:var(--text-muted)">${toggleIcon}</span>
+        </div>`;
+
+        if (!collapsed) {
+            html += '<div class="schedule-stages">';
+            stages.forEach((text, i) => {
+                const stageNum = i + 1;
+                const isDone = stageNum < currentStage;
+                const isActive = stageNum === currentStage;
+                let status = '';
+                let timerText = '';
+
+                if (isDone) {
+                    status = 'done';
+                    const sentAt = new Date(startTime).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+                    timerText = 'sent ' + sentAt;
+                } else if (isActive) {
+                    status = 'active';
+                    timerText = 'next in ' + activeTimer;
+                } else {
+                    status = 'pending';
+                    const secsUntilThis = Math.max(0, intervalSec * (stageNum - currentStage) - elapsed);
+                    const m = Math.floor(secsUntilThis / 60);
+                    const s = Math.floor(secsUntilThis % 60);
+                    timerText = m > 0 ? `in ~${m}m ${s}s` : `in ~${s}s`;
+                }
+
+                html += `<div class="schedule-stage ${status}">
+                    <span class="schedule-num">${stageNum}</span>
+                    <span class="schedule-text">${escapeHtml(text)}</span>
+                    <span class="schedule-timer">${timerText}</span>
+                </div>`;
+            });
+            html += '</div>';
+        }
+
+        scheduleEl.innerHTML = html;
+    }
+
+    // Expose toggle for onclick
+    window._toggleScheduleCollapse = () => { collapsed = !collapsed; render(); };
+
+    render();
+    _stagesTimerInterval = setInterval(render, 1000);
+    scrollToBottom();
+}
+
+// ═══ Auto-Kill Timer ═══
+
+let _autoKillEnabled = false;
+let _autoKillMinutes = 30;
+let _autoKillTimer = null;
+
+function toggleAutoKill() {
+    const toggle = document.getElementById('auto-kill-toggle');
+    _autoKillEnabled = toggle.checked;
+    const settingsDiv = document.getElementById('auto-kill-settings');
+    if (settingsDiv) settingsDiv.style.display = _autoKillEnabled ? '' : 'none';
+    if (_autoKillEnabled) {
+        initAllSliderFills(settingsDiv);
+    }
+    // Clear any existing timer
+    if (_autoKillTimer) { clearTimeout(_autoKillTimer); _autoKillTimer = null; }
+}
+
+function updateAutoKillDuration(input) {
+    _autoKillMinutes = parseInt(input.value);
+    const numInput = document.getElementById('auto-kill-num');
+    if (numInput) numInput.value = _autoKillMinutes;
+    updateSliderFill(input);
+}
+
+function setAutoKillNum(input) {
+    let val = parseInt(input.value) || 30;
+    val = Math.max(1, Math.min(720, val));
+    input.value = val;
+    _autoKillMinutes = val;
+    const slider = document.getElementById('auto-kill-duration');
+    if (slider) {
+        slider.value = Math.min(val, 120);
+        updateSliderFill(slider);
+    }
+}
+
+function startAutoKillTimer() {
+    if (!_autoKillEnabled) return;
+    if (_autoKillTimer) clearTimeout(_autoKillTimer);
+    _autoKillTimer = setTimeout(() => {
+        addSystemMessage(`Auto-stop: ${_autoKillMinutes}min timer reached. Killing all.`);
+        sendKill();
+        _autoKillTimer = null;
+    }, _autoKillMinutes * 60 * 1000);
+}
+
 function sendKill() {
     safeSend({ action: 'kill' });
+    if (_autoKillTimer) { clearTimeout(_autoKillTimer); _autoKillTimer = null; }
 }
 
 function clearHistory() {
     safeSend({ action: 'clear_history' });
 }
 
+// ═══ Stage Builder ═══
+
+let _sbStages = [{ text: '', subs: [] }, { text: '', subs: [] }];
+
+function spinTime(inputId, delta, min, max) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    let val = parseInt(el.value || '0') + delta;
+    if (val < min) val = min;
+    if (val > max) val = max;
+    el.value = val;
+}
+
+function openStageBuilder() {
+    const modal = document.getElementById('stage-builder-modal');
+    if (!modal) return;
+    _sbStages = [{ text: '', subs: [] }, { text: '', subs: [] }];
+    renderBuilderStages();
+    modal.classList.add('open');
+}
+
+function closeStageBuilder() {
+    const modal = document.getElementById('stage-builder-modal');
+    if (modal) modal.classList.remove('open');
+}
+
+function addBuilderStage() {
+    _sbStages.push({ text: '', subs: [] });
+    renderBuilderStages();
+    const list = document.getElementById('stage-builder-list');
+    const cards = list.querySelectorAll('.stage-builder-card');
+    const lastCard = cards[cards.length - 1];
+    if (lastCard) lastCard.querySelector('textarea')?.focus();
+}
+
+function removeBuilderStage(idx) {
+    if (_sbStages.length <= 2) return;
+    _sbStages.splice(idx, 1);
+    renderBuilderStages();
+}
+
+function moveBuilderStage(idx, dir) {
+    const newIdx = idx + dir;
+    if (newIdx < 0 || newIdx >= _sbStages.length) return;
+    [_sbStages[idx], _sbStages[newIdx]] = [_sbStages[newIdx], _sbStages[idx]];
+    renderBuilderStages();
+}
+
+function saveBuilderStageText(idx, value) {
+    _sbStages[idx].text = value;
+}
+
+function addSubEvent(stageIdx) {
+    _sbStages[stageIdx].subs.push('');
+    renderBuilderStages();
+    // Focus new sub textarea
+    const card = document.querySelectorAll('.stage-builder-card')[stageIdx];
+    if (card) {
+        const subs = card.querySelectorAll('.sub-event-input');
+        if (subs.length) subs[subs.length - 1].focus();
+    }
+}
+
+function removeSubEvent(stageIdx, subIdx) {
+    _sbStages[stageIdx].subs.splice(subIdx, 1);
+    renderBuilderStages();
+}
+
+function saveSubEventText(stageIdx, subIdx, value) {
+    _sbStages[stageIdx].subs[subIdx] = value;
+}
+
+function renderBuilderStages() {
+    const list = document.getElementById('stage-builder-list');
+    if (!list) return;
+    list.innerHTML = '';
+    _sbStages.forEach((stage, i) => {
+        const card = document.createElement('div');
+        card.className = 'stage-builder-card';
+
+        let subsHtml = '';
+        if (stage.subs.length > 0) {
+            subsHtml = '<div class="sub-events-list">';
+            stage.subs.forEach((sub, si) => {
+                const letter = String.fromCharCode(97 + si); // a, b, c...
+                subsHtml += `
+                    <div class="sub-event-row">
+                        <span class="sub-event-label">${i + 1}${letter}</span>
+                        <input type="text" class="sub-event-input" placeholder="Sub-event ${letter}..." value="${escapeHtml(sub)}" oninput="saveSubEventText(${i},${si},this.value)">
+                        <button class="sub-event-remove" onclick="removeSubEvent(${i},${si})" title="Remove">&times;</button>
+                    </div>`;
+            });
+            subsHtml += '</div>';
+        }
+
+        card.innerHTML = `
+            <div class="stage-builder-main">
+                <span class="stage-builder-num">${i + 1}</span>
+                <textarea rows="2" placeholder="Stage ${i + 1} prompt..." oninput="saveBuilderStageText(${i}, this.value)">${escapeHtml(stage.text)}</textarea>
+                <div class="stage-builder-actions">
+                    <button onclick="moveBuilderStage(${i},-1)" title="Move up">${i > 0 ? '&#9650;' : ''}</button>
+                    <button onclick="moveBuilderStage(${i},1)" title="Move down">${i < _sbStages.length - 1 ? '&#9660;' : ''}</button>
+                    <button class="sb-remove" onclick="removeBuilderStage(${i})" title="Remove">${_sbStages.length > 2 ? '&times;' : ''}</button>
+                </div>
+            </div>
+            ${subsHtml}
+            <button class="sub-event-add" onclick="addSubEvent(${i})">+ sub</button>
+        `;
+        list.appendChild(card);
+    });
+}
+
+function _flattenStages() {
+    // Flatten stages with sub-events into a linear list for the server
+    // Each stage becomes: [main, sub_a, sub_b, ...] with fractional intervals
+    const result = [];
+    for (const stage of _sbStages) {
+        const mainText = stage.text.trim();
+        if (!mainText) continue;
+        const validSubs = stage.subs.map(s => s.trim()).filter(s => s.length > 0);
+        if (validSubs.length === 0) {
+            result.push({ prompts: [mainText], count: 1 });
+        } else {
+            result.push({ prompts: [mainText, ...validSubs], count: 1 + validSubs.length });
+        }
+    }
+    return result;
+}
+
+function startStageBuilder() {
+    const stageGroups = _flattenStages();
+    if (stageGroups.length < 2) {
+        addSystemMessage('Need at least 2 stages to start.');
+        return;
+    }
+
+    const intHr = parseInt(document.getElementById('sb-int-hr')?.value || '0');
+    const intMin = parseInt(document.getElementById('sb-int-min')?.value || '2');
+    const interval = intHr * 60 + intMin;
+    if (interval < 1) {
+        addSystemMessage('Stage interval must be at least 1 minute.');
+        return;
+    }
+    const autoKillEnabled = document.getElementById('sb-auto-kill')?.checked || false;
+    const killHr = parseInt(document.getElementById('sb-kill-hr')?.value || '0');
+    const killMin = parseInt(document.getElementById('sb-kill-min')?.value || '30');
+    const autoKillMinutes = autoKillEnabled ? (killHr * 60 + killMin) : 0;
+
+    // Flatten into linear prompts with per-prompt intervals
+    // Each stage group divides the interval by its prompt count
+    const flatStages = [];
+    const flatIntervals = [];
+    for (const group of stageGroups) {
+        const subInterval = interval / group.count;
+        for (const prompt of group.prompts) {
+            flatStages.push(prompt);
+            flatIntervals.push(subInterval);
+        }
+    }
+
+    safeSend({
+        action: 'send_stages',
+        stages: flatStages,
+        intervals: flatIntervals,
+        interval_minutes: Math.max(0.5, interval),
+        auto_kill_after_last: autoKillMinutes > 0 ? autoKillMinutes : null,
+    });
+
+    closeStageBuilder();
+}
+
+// ═══ Export Options Modal ═══
+
+const _ico = {
+    cyber: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/><circle cx="16" cy="16" r="2"/></svg>',
+    bbs: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="6" y1="7" x2="10" y2="7"/><line x1="6" y1="10" x2="14" y2="10"/><line x1="6" y1="13" x2="11" y2="13"/></svg>',
+    clean: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
+    neon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
+    comic: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L14.5 9H22L16 13.5L18 21L12 17L6 21L8 13.5L2 9H9.5L12 2Z"/></svg>',
+    terminal: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
+};
+
+const STORYBOOK_TEMPLATES = [
+    { id: 'cyberpunk', name: 'Cyberpunk Noir', icon: _ico.cyber, desc: 'Dark neon gradients', colors: { accent: '#00ffc8', highlight: '#bd00ff', bg: '#0a0a0f', text: '#d4d4d8' } },
+    { id: 'bbs', name: 'BBS Terminal', icon: _ico.bbs, desc: 'Green phosphor retro', colors: { accent: '#33ff33', highlight: '#1a5a1a', bg: '#0a0a00', text: '#33ff33' } },
+    { id: 'clean', name: 'Clean Light', icon: _ico.clean, desc: 'Minimal white serif', colors: { accent: '#1a1a1a', highlight: '#555555', bg: '#fafafa', text: '#2a2a2a' } },
+    { id: 'neon', name: 'Neon Dreams', icon: _ico.neon, desc: 'Heavy glow effects', colors: { accent: '#00ffff', highlight: '#ff0080', bg: '#05050a', text: '#e0d0ff' } },
+];
+
+const FLIPBOOK_TEMPLATES = [
+    { id: 'cyber', name: 'Cyber', icon: _ico.cyber, desc: 'Neon Ken Burns', colors: { accent: '#00ffc8', highlight: '#bd00ff', bg: '#000000', text: '#e8e8ea' } },
+    { id: 'comic', name: 'Comic', icon: _ico.comic, desc: 'Bold borders, halftone', colors: { accent: '#ffee33', highlight: '#ff3366', bg: '#1a1a2e', text: '#1a1a2e' } },
+    { id: 'terminal', name: 'Terminal', icon: _ico.terminal, desc: 'Scanlines, green CRT', colors: { accent: '#33ff33', highlight: '#1a5a1a', bg: '#0a0a00', text: '#33ff33' } },
+    { id: 'clean', name: 'Clean', icon: _ico.clean, desc: 'Minimal, no effects', colors: { accent: '#ffffff', highlight: '#cccccc', bg: '#111111', text: '#ffffff' } },
+];
+
+let _exportState = { type: null, sessionId: null, template: null };
+
+function openExportModal(type, sessionId) {
+    _exportState = { type, sessionId, template: null };
+    const modal = document.getElementById('export-modal');
+    const title = document.getElementById('export-modal-title');
+    const templatesEl = document.getElementById('export-templates');
+    const sbOpts = document.getElementById('export-storybook-options');
+    const fbOpts = document.getElementById('export-flipbook-options');
+
+    title.textContent = type === 'storybook' ? 'Export Storybook' : 'Export Flip Book';
+    sbOpts.style.display = type === 'storybook' ? '' : 'none';
+    fbOpts.style.display = type === 'flipbook' ? '' : 'none';
+
+    // Reset shared fields
+    document.getElementById('export-custom-title').value = '';
+    document.getElementById('export-custom-subtitle').value = '';
+    document.getElementById('export-prompt-title').checked = false;
+
+    const templates = type === 'storybook' ? STORYBOOK_TEMPLATES : FLIPBOOK_TEMPLATES;
+    templatesEl.innerHTML = '';
+    function _setExportColors(colors) {
+        document.getElementById('export-color-accent').value = colors.accent;
+        document.getElementById('export-color-highlight').value = colors.highlight;
+        document.getElementById('export-color-bg').value = colors.bg;
+        document.getElementById('export-color-text').value = colors.text;
+    }
+    templates.forEach((t, i) => {
+        const card = document.createElement('div');
+        card.className = 'export-template-card' + (i === 0 ? ' selected' : '');
+        card.innerHTML = `<span class="template-icon">${t.icon}</span><div class="template-name">${t.name}</div><div class="template-desc">${t.desc}</div>`;
+        card.onclick = () => {
+            templatesEl.querySelectorAll('.export-template-card').forEach(c => c.classList.remove('selected'));
+            card.classList.add('selected');
+            _exportState.template = t.id;
+            _setExportColors(t.colors);
+        };
+        templatesEl.appendChild(card);
+    });
+    _exportState.template = templates[0].id;
+    _setExportColors(templates[0].colors);
+
+    // Init slider fills and speed display
+    const speedSlider = document.getElementById('export-speed');
+    if (speedSlider) {
+        updateFlipbookSpeed(speedSlider);
+    }
+
+    modal.classList.add('open');
+}
+
+function closeExportModal() {
+    document.getElementById('export-modal').classList.remove('open');
+}
+
+// Convert 0-100 slider to seconds: 0=20s (slow), 100=0.2s (movie speed)
+function _sliderToSeconds(val) {
+    // Exponential curve: 20 * (0.01 ^ (val/100)) = 20 at 0, 0.2 at 100
+    return Math.max(0.2, 20 * Math.pow(0.01, val / 100));
+}
+
+function updateFlipbookSpeed(input) {
+    const secs = _sliderToSeconds(parseInt(input.value));
+    document.getElementById('export-speed-val').textContent = secs.toFixed(1);
+    updateSliderFill(input);
+}
+
+function confirmExport() {
+    const { type, sessionId, template } = _exportState;
+    if (!sessionId) return;
+    const params = new URLSearchParams();
+    if (template) params.set('template', template);
+
+    // Shared title/subtitle options
+    const customTitle = document.getElementById('export-custom-title').value.trim();
+    const customSubtitle = document.getElementById('export-custom-subtitle').value.trim();
+    if (customTitle) params.set('title', customTitle);
+    if (customSubtitle) params.set('subtitle', customSubtitle);
+    if (document.getElementById('export-prompt-title').checked) params.set('prompt_title', '1');
+
+    // Colors
+    params.set('color_accent', document.getElementById('export-color-accent').value);
+    params.set('color_highlight', document.getElementById('export-color-highlight').value);
+    params.set('color_bg', document.getElementById('export-color-bg').value);
+    params.set('color_text', document.getElementById('export-color-text').value);
+
+    if (type === 'storybook') {
+        if (document.getElementById('export-image-captions').checked) params.set('captions', '1');
+    } else if (type === 'flipbook') {
+        const sliderVal = parseInt(document.getElementById('export-speed').value);
+        const seconds = _sliderToSeconds(sliderVal);
+        params.set('speed', seconds.toFixed(1));
+        if (!document.getElementById('export-show-text').checked) params.set('hide_text', '1');
+    }
+
+    const qs = params.toString();
+    const url = `/${type}/${sessionId}${qs ? '?' + qs : ''}`;
+    window.open(url, '_blank');
+    closeExportModal();
+}
+
 function exportStorybook() {
     if (!currentSessionId) return;
-    window.open(`/storybook/${currentSessionId}`, '_blank');
+    openExportModal('storybook', currentSessionId);
 }
 
 function exportSessionStorybook(sessionId) {
-    window.open(`/storybook/${sessionId}`, '_blank');
     closeAllSessionMenus();
+    openExportModal('storybook', sessionId);
 }
 
 function exportSessionFlipbook(sessionId) {
-    window.open(`/flipbook/${sessionId}`, '_blank');
     closeAllSessionMenus();
+    openExportModal('flipbook', sessionId);
+}
+
+function exportSessionPrompts(sessionId) {
+    closeAllSessionMenus();
+    window.open(`/prompts/${sessionId}`, '_blank');
 }
 
 function toggleSessionMenu(sessionId, btn) {
@@ -1243,10 +1691,16 @@ function toggleSessionMenu(sessionId, btn) {
     const wasOpen = menu.classList.contains('open');
     closeAllSessionMenus();
     if (!wasOpen) {
-        // Position menu using fixed coordinates
+        // Position menu to the right of the gear button so it doesn't overlap session text
         const rect = btn.getBoundingClientRect();
-        menu.style.top = (rect.bottom + 4) + 'px';
-        menu.style.left = Math.max(8, rect.right - 160) + 'px';
+        const menuWidth = 180;
+        let left = rect.right + 6;
+        // If it would go off-screen, flip to left side
+        if (left + menuWidth > window.innerWidth - 8) {
+            left = rect.left - menuWidth - 6;
+        }
+        menu.style.top = rect.top + 'px';
+        menu.style.left = Math.max(8, left) + 'px';
         menu.classList.add('open');
         // Close on outside click
         setTimeout(() => {

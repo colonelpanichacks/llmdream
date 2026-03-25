@@ -7,3 +7,5 @@ chatroom_config.json.bak
 sessions/
 static/images/
 .DS_Store
+.claude/
+CLAUDE.md

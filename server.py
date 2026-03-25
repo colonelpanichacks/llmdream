@@ -6,9 +6,9 @@ import random
 import time
 import httpx
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from ollama_client import list_models, chat_stream, chat_no_stream, unload_model, IMAGE_GEN_TOOL, DEFAULT_OLLAMA_HOST
 from context import ChatroomContext
@@ -30,9 +30,11 @@ _INTERRUPT_WINDOW = 2.0  # seconds — second Enter within this window = interru
 
 # Story stages (multi-step prompts)
 story_stages: list[str] = []
+stage_intervals: list[float] = []  # per-stage intervals in minutes (for sub-event support)
 current_stage = 0
 stage_started_at = 0.0  # timestamp when current stage began
 stage_interval_minutes = 2.0  # minutes between stage injections (configurable via settings)
+_auto_kill_after_last_minutes = None  # minutes after last stage before auto-kill (set by stage builder)
 
 # Stable Diffusion settings (mutable at runtime via WebSocket)
 sd_settings = {
@@ -45,7 +47,9 @@ sd_settings = {
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 IMAGES_DIR = os.path.join(STATIC_DIR, "images")
+EXPORTS_DIR = os.path.join(STATIC_DIR, "exports")
 os.makedirs(IMAGES_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -98,221 +102,228 @@ async def index():
     return resp
 
 
-@app.get("/storybook/{session_id}")
-async def storybook(session_id: str):
-    """Render a session as a beautiful storybook — model text + images only, no user/system messages."""
-    import glob as _glob
-    # Load session
+def _load_session(session_id: str):
+    """Load a session JSON file, return (data, error_response)."""
     session_path = os.path.join(os.path.dirname(__file__), "sessions", f"{session_id}.json")
     if not os.path.exists(session_path):
-        return HTMLResponse("<h1>Session not found</h1>", status_code=404)
+        return None, HTMLResponse("<h1>Session not found</h1>", status_code=404)
     with open(session_path) as f:
-        session_data = json.load(f)
-    history = session_data.get("history", [])
-    title = session_data.get("title", "Untitled Story")
+        return json.load(f), None
 
-    # Build story content — only model messages (skip user, Director, system)
+
+def _build_story_sections(history, captions=False):
+    """Build HTML sections from session history. Returns (sections_html, img_count, first_prompt)."""
     sections = []
+    img_count = 0
+    first_prompt = ""
+    last_user_msg = ""
+
     for msg in history:
         role = msg.get("role", "")
         name = msg.get("name", "")
         content = msg.get("content", "").strip()
         images = msg.get("images", [])
 
-        # Skip user messages, Director stages, system messages
-        if role == "user" or name in ("User", "Director"):
+        if role == "user":
+            last_user_msg = content
+            if not first_prompt:
+                first_prompt = content
+            continue
+        if name in ("User", "Director"):
             continue
         if not content and not images:
             continue
 
-        # Clean content — strip image markdown from text (we render images separately)
         clean = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', content).strip()
-        # Strip leftover artifacts
         clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
 
         section_html = ""
         if clean:
-            # Convert paragraphs
             paragraphs = clean.split('\n\n')
             for p in paragraphs:
                 p = p.strip()
                 if p:
-                    # Simple markdown: **bold**, *italic*
                     p = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', p)
                     p = re.sub(r'\*(.+?)\*', r'<em>\1</em>', p)
                     section_html += f'<p>{p}</p>\n'
 
-        # Add images
         for img_url in images:
-            section_html += f'<figure><img src="{img_url}" alt="Generated illustration" loading="lazy"></figure>\n'
+            section_html += f'<figure><img src="{img_url}" alt="Generated illustration" loading="lazy">'
+            if captions:
+                # Try to extract image prompt from the message content
+                prompt_match = re.search(r'generate_image["\s:]+["\']?([^"\'}\]]+)', content, re.I)
+                if prompt_match:
+                    cap = prompt_match.group(1).strip()[:200]
+                    section_html += f'<figcaption>{cap}</figcaption>'
+            section_html += '</figure>\n'
+            img_count += 1
 
         if section_html:
-            color = msg.get("color", "#888")
             sections.append(section_html)
 
-    story_body = "\n".join(sections)
+    return "\n".join(sections), img_count, first_prompt
 
-    # Count images
-    img_count = sum(len(msg.get("images", [])) for msg in history if msg.get("role") != "user")
+
+# ═══ Storybook templates ═══
+
+STORYBOOK_STYLES = {
+    "cyberpunk": """
+@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a0f; color:#d4d4d8; font-family:'Crimson Pro',Georgia,serif; font-size:1.2rem; line-height:1.8; min-height:100vh; }
+.storybook-header { text-align:center; padding:80px 20px 60px; border-bottom:1px solid rgba(0,255,200,0.1); background:linear-gradient(180deg,rgba(189,0,255,0.05) 0%,transparent 100%); }
+.storybook-title { font-size:clamp(2rem,5vw,3.5rem); font-weight:600; background:linear-gradient(135deg,#bd00ff,#00ffc8); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:12px; letter-spacing:1px; }
+.storybook-subtitle { font-family:'Crimson Pro',Georgia,serif; font-size:1rem; color:#888; font-style:italic; margin-top:8px; max-width:600px; margin-left:auto; margin-right:auto; }
+.storybook-meta { font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:#666; letter-spacing:2px; text-transform:uppercase; margin-top:12px; }
+.storybook-content { max-width:720px; margin:0 auto; padding:60px 24px 120px; }
+.storybook-content p { margin-bottom:1.4em; text-indent:1.5em; }
+.storybook-content p:first-child { text-indent:0; }
+.storybook-content p:first-child::first-letter { font-size:3.2em; float:left; line-height:0.8; margin-right:8px; margin-top:6px; background:linear-gradient(135deg,#bd00ff,#00ffc8); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; font-weight:600; }
+.storybook-content strong { color:#00ffc8; font-weight:600; }
+.storybook-content em { color:#c8b4ff; font-style:italic; }
+.storybook-content figure { margin:40px -60px; text-align:center; }
+.storybook-content figure img { width:100%; max-width:900px; border-radius:8px; box-shadow:0 8px 40px rgba(0,0,0,0.6),0 0 80px rgba(189,0,255,0.08); }
+.storybook-content figcaption { font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:#555; margin-top:8px; letter-spacing:1px; font-style:italic; }
+.storybook-footer { text-align:center; padding:40px 20px 60px; border-top:1px solid rgba(0,255,200,0.1); font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:#444; letter-spacing:3px; text-transform:uppercase; }
+@media (max-width:800px) { .storybook-content figure { margin:30px -12px; } }
+@media print { body { background:white; color:#222; } .storybook-title { color:#222; -webkit-text-fill-color:#222; } .storybook-content figure img { box-shadow:none; border:1px solid #ddd; } }
+""",
+    "bbs": """
+@import url('https://fonts.googleapis.com/css2?family=VT323&family=JetBrains+Mono:wght@400&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a00; color:#33ff33; font-family:'VT323','Courier New',monospace; font-size:1.3rem; line-height:1.6; min-height:100vh; text-shadow:0 0 8px rgba(51,255,51,0.3); }
+.storybook-header { text-align:center; padding:60px 20px 40px; border-bottom:1px solid #1a3a1a; }
+.storybook-header::before { content:'╔══════════════════════════════════╗'; display:block; color:#1a5a1a; font-size:0.8rem; margin-bottom:16px; }
+.storybook-header::after { content:'╚══════════════════════════════════╝'; display:block; color:#1a5a1a; font-size:0.8rem; margin-top:16px; }
+.storybook-title { font-size:clamp(1.8rem,4vw,3rem); color:#33ff33; letter-spacing:4px; text-transform:uppercase; text-shadow:0 0 20px rgba(51,255,51,0.5); margin-bottom:8px; }
+.storybook-subtitle { font-size:1rem; color:#22aa22; margin-top:8px; }
+.storybook-meta { font-size:0.8rem; color:#1a5a1a; letter-spacing:3px; margin-top:12px; }
+.storybook-content { max-width:720px; margin:0 auto; padding:40px 24px 120px; }
+.storybook-content p { margin-bottom:1.2em; text-indent:0; }
+.storybook-content p::before { content:'> '; color:#1a5a1a; }
+.storybook-content strong { color:#66ff66; }
+.storybook-content em { color:#88cc88; font-style:normal; text-decoration:underline; }
+.storybook-content figure { margin:30px 0; text-align:center; border:1px solid #1a5a1a; padding:8px; }
+.storybook-content figure img { width:100%; max-width:800px; border:2px solid #33ff33; image-rendering:auto; filter:saturate(0.7) brightness(0.9); }
+.storybook-content figcaption { font-size:0.8rem; color:#1a5a1a; margin-top:6px; }
+.storybook-footer { text-align:center; padding:40px 20px; border-top:1px solid #1a3a1a; font-size:0.8rem; color:#1a5a1a; letter-spacing:3px; }
+@media print { body { background:white; color:#222; text-shadow:none; } }
+""",
+    "clean": """
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,400;0,600;1,400&family=Inter:wght@400&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#fafafa; color:#2a2a2a; font-family:'Source Serif 4','Georgia',serif; font-size:1.15rem; line-height:1.9; min-height:100vh; }
+.storybook-header { text-align:center; padding:80px 20px 60px; border-bottom:1px solid #e0e0e0; }
+.storybook-title { font-size:clamp(2rem,5vw,3.5rem); font-weight:600; color:#1a1a1a; margin-bottom:8px; }
+.storybook-subtitle { font-size:1rem; color:#888; font-style:italic; margin-top:8px; max-width:600px; margin-left:auto; margin-right:auto; }
+.storybook-meta { font-family:'Inter',sans-serif; font-size:0.7rem; color:#aaa; letter-spacing:2px; text-transform:uppercase; margin-top:12px; }
+.storybook-content { max-width:680px; margin:0 auto; padding:60px 24px 120px; }
+.storybook-content p { margin-bottom:1.4em; text-indent:1.5em; }
+.storybook-content p:first-child { text-indent:0; }
+.storybook-content p:first-child::first-letter { font-size:3em; float:left; line-height:0.8; margin-right:6px; margin-top:6px; color:#1a1a1a; font-weight:600; }
+.storybook-content strong { color:#1a1a1a; }
+.storybook-content em { color:#555; }
+.storybook-content figure { margin:40px -40px; text-align:center; }
+.storybook-content figure img { width:100%; max-width:800px; border-radius:4px; box-shadow:0 4px 20px rgba(0,0,0,0.08); }
+.storybook-content figcaption { font-family:'Inter',sans-serif; font-size:0.75rem; color:#999; margin-top:8px; font-style:italic; }
+.storybook-footer { text-align:center; padding:40px 20px 60px; border-top:1px solid #e0e0e0; font-family:'Inter',sans-serif; font-size:0.65rem; color:#bbb; letter-spacing:3px; text-transform:uppercase; }
+@media (max-width:800px) { .storybook-content figure { margin:30px -12px; } }
+""",
+    "neon": """
+@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=Orbitron:wght@400;700&family=JetBrains+Mono:wght@400&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#05050a; color:#e0d0ff; font-family:'Crimson Pro',Georgia,serif; font-size:1.2rem; line-height:1.8; min-height:100vh; }
+.storybook-header { text-align:center; padding:80px 20px 60px; border-bottom:1px solid rgba(255,0,128,0.15); background:radial-gradient(ellipse at 50% 0%,rgba(255,0,128,0.08) 0%,transparent 70%); }
+.storybook-title { font-family:'Orbitron',sans-serif; font-size:clamp(1.8rem,5vw,3rem); font-weight:700; color:#ff0080; text-shadow:0 0 30px rgba(255,0,128,0.5),0 0 60px rgba(255,0,128,0.2); margin-bottom:12px; letter-spacing:3px; text-transform:uppercase; }
+.storybook-subtitle { font-size:1rem; color:#8866aa; font-style:italic; margin-top:8px; max-width:600px; margin-left:auto; margin-right:auto; }
+.storybook-meta { font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:#553377; letter-spacing:2px; text-transform:uppercase; margin-top:12px; }
+.storybook-content { max-width:720px; margin:0 auto; padding:60px 24px 120px; }
+.storybook-content p { margin-bottom:1.4em; text-indent:1.5em; }
+.storybook-content p:first-child { text-indent:0; }
+.storybook-content p:first-child::first-letter { font-size:3.2em; float:left; line-height:0.8; margin-right:8px; margin-top:6px; color:#ff0080; text-shadow:0 0 20px rgba(255,0,128,0.4); font-weight:600; }
+.storybook-content strong { color:#00ffff; text-shadow:0 0 8px rgba(0,255,255,0.3); }
+.storybook-content em { color:#ff80bf; font-style:italic; }
+.storybook-content figure { margin:40px -60px; text-align:center; }
+.storybook-content figure img { width:100%; max-width:900px; border-radius:8px; box-shadow:0 0 40px rgba(255,0,128,0.15),0 0 80px rgba(0,255,255,0.08); border:1px solid rgba(255,0,128,0.2); }
+.storybook-content figcaption { font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:#553377; margin-top:8px; letter-spacing:1px; }
+.storybook-footer { text-align:center; padding:40px 20px 60px; border-top:1px solid rgba(255,0,128,0.15); font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:#332255; letter-spacing:3px; text-transform:uppercase; }
+@media (max-width:800px) { .storybook-content figure { margin:30px -12px; } }
+@media print { body { background:white; color:#222; } .storybook-title { color:#222; text-shadow:none; -webkit-text-fill-color:#222; } }
+""",
+}
+
+
+def _storybook_color_overrides(accent: str, highlight: str, bg: str, text: str) -> str:
+    """Generate CSS overrides for custom storybook colors."""
+    if not any([accent, highlight, bg, text]):
+        return ""
+    css = ""
+    if bg:
+        css += f"body {{ background: {bg}; }}\n"
+    if text:
+        css += f"body {{ color: {text}; }}\n"
+    if highlight and accent:
+        css += f".storybook-title {{ background: linear-gradient(135deg, {highlight}, {accent}); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }}\n"
+        css += f".storybook-content p:first-child::first-letter {{ background: linear-gradient(135deg, {highlight}, {accent}); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }}\n"
+    if accent:
+        css += f".storybook-content strong {{ color: {accent}; }}\n"
+    if highlight:
+        css += f".storybook-content em {{ color: {highlight}; }}\n"
+        css += f".storybook-header {{ border-bottom-color: {highlight}33; }}\n"
+        css += f".storybook-footer {{ border-top-color: {highlight}33; }}\n"
+    return css
+
+
+@app.get("/storybook/{session_id}")
+async def storybook(session_id: str, template: str = Query("cyberpunk"), captions: str = Query(""),
+                    title: str = Query(""), subtitle: str = Query(""), prompt_title: str = Query(""),
+                    color_accent: str = Query(""), color_highlight: str = Query(""),
+                    color_bg: str = Query(""), color_text: str = Query("")):
+    """Render a session as a beautiful storybook with template support."""
+    session_data, err = _load_session(session_id)
+    if err:
+        return err
+    history = session_data.get("history", [])
+    session_title = session_data.get("title", "Untitled Story")
+    show_captions = captions == "1"
+    use_prompt_title = prompt_title == "1"
+
+    story_body, img_count, first_prompt = _build_story_sections(history, captions=show_captions)
+    style = STORYBOOK_STYLES.get(template, STORYBOOK_STYLES["cyberpunk"])
+    color_css = _storybook_color_overrides(color_accent, color_highlight, color_bg, color_text)
+
+    # Resolve title: custom > prompt > session (prefer full first_prompt over truncated session title)
+    display_title = title if title else (first_prompt if (use_prompt_title or session_title.endswith("…")) and first_prompt else session_title)
+    subtitle_html = f'<div class="storybook-subtitle">{subtitle}</div>' if subtitle else ""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} — LLM Dream Storybook</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400&display=swap');
-
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-
-body {{
-    background: #0a0a0f;
-    color: #d4d4d8;
-    font-family: 'Crimson Pro', Georgia, serif;
-    font-size: 1.2rem;
-    line-height: 1.8;
-    min-height: 100vh;
-}}
-
-.storybook-header {{
-    text-align: center;
-    padding: 80px 20px 60px;
-    border-bottom: 1px solid rgba(0, 255, 200, 0.1);
-    background: linear-gradient(180deg, rgba(189, 0, 255, 0.05) 0%, transparent 100%);
-}}
-
-.storybook-title {{
-    font-size: clamp(2rem, 5vw, 3.5rem);
-    font-weight: 600;
-    background: linear-gradient(135deg, #bd00ff, #00ffc8);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin-bottom: 12px;
-    letter-spacing: 1px;
-}}
-
-.storybook-meta {{
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.7rem;
-    color: #666;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-}}
-
-.storybook-content {{
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 60px 24px 120px;
-}}
-
-.storybook-content p {{
-    margin-bottom: 1.4em;
-    text-indent: 1.5em;
-}}
-
-.storybook-content p:first-child {{
-    text-indent: 0;
-}}
-
-.storybook-content p:first-child::first-letter {{
-    font-size: 3.2em;
-    float: left;
-    line-height: 0.8;
-    margin-right: 8px;
-    margin-top: 6px;
-    background: linear-gradient(135deg, #bd00ff, #00ffc8);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    font-weight: 600;
-}}
-
-.storybook-content strong {{
-    color: #00ffc8;
-    font-weight: 600;
-}}
-
-.storybook-content em {{
-    color: #c8b4ff;
-    font-style: italic;
-}}
-
-.storybook-content figure {{
-    margin: 40px -60px;
-    text-align: center;
-}}
-
-@media (max-width: 800px) {{
-    .storybook-content figure {{
-        margin: 30px -12px;
-    }}
-}}
-
-.storybook-content figure img {{
-    width: 100%;
-    max-width: 900px;
-    border-radius: 8px;
-    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6), 0 0 80px rgba(189, 0, 255, 0.08);
-}}
-
-.storybook-footer {{
-    text-align: center;
-    padding: 40px 20px 60px;
-    border-top: 1px solid rgba(0, 255, 200, 0.1);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.65rem;
-    color: #444;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-}}
-
-.storybook-divider {{
-    text-align: center;
-    margin: 40px 0;
-    color: #333;
-    font-size: 1.5rem;
-    letter-spacing: 12px;
-}}
-
-@media print {{
-    body {{ background: white; color: #222; }}
-    .storybook-header {{ border-bottom-color: #ccc; }}
-    .storybook-title {{ color: #222; -webkit-text-fill-color: #222; }}
-    .storybook-content figure {{ margin: 20px 0; }}
-    .storybook-content figure img {{ box-shadow: none; border: 1px solid #ddd; }}
-}}
-</style>
+<title>{display_title} &mdash; LLM Dream Storybook</title>
+<style>{style}
+{color_css}</style>
 </head>
 <body>
 <header class="storybook-header">
-    <h1 class="storybook-title">{title}</h1>
-    <div class="storybook-meta">LLM Dream 👾 &mdash; {img_count} illustrations</div>
+    <h1 class="storybook-title">{display_title}</h1>
+    {subtitle_html}
+    <div class="storybook-meta">LLM Dream &mdash; {img_count} illustrations</div>
 </header>
 <article class="storybook-content">
 {story_body}
 </article>
 <footer class="storybook-footer">
-    Generated by LLM Dream 👾
+    Generated by LLM Dream
 </footer>
 </body>
 </html>"""
     return HTMLResponse(html)
 
 
-@app.get("/flipbook/{session_id}")
-async def flipbook(session_id: str):
-    """Animated flipbook — full-screen image slideshow with cinematic text overlays."""
-    session_path = os.path.join(os.path.dirname(__file__), "sessions", f"{session_id}.json")
-    if not os.path.exists(session_path):
-        return HTMLResponse("<h1>Session not found</h1>", status_code=404)
-    with open(session_path) as f:
-        session_data = json.load(f)
-    history = session_data.get("history", [])
-    title = session_data.get("title", "Untitled Story")
-
-    # Build slides: pair each image with its surrounding text
+def _build_flipbook_slides(history):
+    """Build flipbook slide data from session history."""
     slides = []
     current_text = ""
     for msg in history:
@@ -322,85 +333,191 @@ async def flipbook(session_id: str):
             continue
         content = msg.get("content", "").strip()
         images = msg.get("images", [])
-        # Clean text
         clean = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', content).strip()
         clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
         if clean:
-            # Simple markdown
             clean = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', clean)
             clean = re.sub(r'\*(.+?)\*', r'<em>\1</em>', clean)
             current_text += clean + " "
         for img_url in images:
-            # Truncate text to ~200 chars for overlay
             overlay = current_text.strip()
-            if len(overlay) > 250:
-                overlay = overlay[-250:]
-                # Cut at sentence boundary
-                dot = overlay.find('. ')
-                if dot > 20:
-                    overlay = overlay[dot+2:]
             slides.append({"url": img_url, "text": overlay})
             current_text = ""
+    return slides
 
+
+# ═══ Flipbook templates ═══
+
+FLIPBOOK_STYLES = {
+    "cyber": {
+        "body": "background:#000; font-family:'Crimson Pro',Georgia,serif; cursor:default;",
+        "img": "width:100%; height:100%; object-fit:contain; background:#000; image-rendering:auto;",
+        "kenburns": True,
+        "overlay_bg": "linear-gradient(transparent, rgba(0,0,0,0.85) 40%)",
+        "overlay_color": "#e8e8ea",
+        "strong_color": "#00ffc8",
+        "em_color": "#c8b4ff",
+        "title_bg": "#0a0a0f",
+        "title_gradient": "linear-gradient(135deg,#bd00ff,#00ffc8)",
+        "progress_gradient": "linear-gradient(90deg,#bd00ff,#00ffc8)",
+        "controls_accent": "#00ffc8",
+    },
+    "comic": {
+        "body": "background:#1a1a2e; font-family:'Bangers','Impact',sans-serif; cursor:default;",
+        "img": "width:100%; height:100%; object-fit:contain; background:#1a1a2e; image-rendering:auto; border:6px solid #fff; box-sizing:border-box;",
+        "kenburns": False,
+        "overlay_bg": "linear-gradient(transparent, rgba(255,255,50,0.95) 50%)",
+        "overlay_color": "#1a1a2e",
+        "overlay_extra": "font-weight:700; font-size:clamp(1rem,2.5vw,1.5rem); text-transform:uppercase; letter-spacing:2px;",
+        "strong_color": "#ff3366",
+        "em_color": "#3366ff",
+        "title_bg": "#1a1a2e",
+        "title_gradient": "linear-gradient(135deg,#ff3366,#ffee33)",
+        "progress_gradient": "linear-gradient(90deg,#ff3366,#ffee33)",
+        "controls_accent": "#ffee33",
+    },
+    "terminal": {
+        "body": "background:#0a0a00; font-family:'VT323','Courier New',monospace; cursor:default;",
+        "img": "width:100%; height:100%; object-fit:contain; background:#0a0a00; image-rendering:auto; filter:saturate(0.6) brightness(0.85);",
+        "kenburns": False,
+        "overlay_bg": "linear-gradient(transparent, rgba(0,0,0,0.9) 40%)",
+        "overlay_color": "#33ff33",
+        "overlay_extra": "text-shadow:0 0 8px rgba(51,255,51,0.4); font-size:clamp(1rem,2vw,1.4rem);",
+        "strong_color": "#66ff66",
+        "em_color": "#88cc88",
+        "title_bg": "#0a0a00",
+        "title_gradient": "none",
+        "title_color": "#33ff33",
+        "title_shadow": "text-shadow:0 0 30px rgba(51,255,51,0.5);",
+        "progress_gradient": "#33ff33",
+        "controls_accent": "#33ff33",
+        "scanlines": True,
+    },
+    "clean": {
+        "body": "background:#111; font-family:'Inter',-apple-system,sans-serif; cursor:default;",
+        "img": "width:100%; height:100%; object-fit:contain; background:#111; image-rendering:auto;",
+        "kenburns": False,
+        "overlay_bg": "linear-gradient(transparent, rgba(0,0,0,0.7) 50%)",
+        "overlay_color": "#e0e0e0",
+        "overlay_extra": "font-style:normal; font-size:clamp(0.85rem,1.5vw,1.1rem);",
+        "strong_color": "#fff",
+        "em_color": "#bbb",
+        "title_bg": "#111",
+        "title_gradient": "none",
+        "title_color": "#fff",
+        "progress_gradient": "#fff",
+        "controls_accent": "#fff",
+    },
+}
+
+
+@app.get("/flipbook/{session_id}")
+async def flipbook(session_id: str, template: str = Query("cyber"), speed: str = Query("6"),
+                   title: str = Query(""), subtitle: str = Query(""), prompt_title: str = Query(""),
+                   color_accent: str = Query(""), color_highlight: str = Query(""),
+                   color_bg: str = Query(""), color_text: str = Query(""),
+                   hide_text: str = Query("")):
+    """Animated flipbook with template support, object-fit:contain, and sharp images."""
+    session_data, err = _load_session(session_id)
+    if err:
+        return err
+    history = session_data.get("history", [])
+    session_title = session_data.get("title", "Untitled Story")
+    try:
+        initial_speed = max(0.2, min(20, float(speed)))
+    except (ValueError, TypeError):
+        initial_speed = 6
+    # Resolve first prompt for prompt_title option
+    first_prompt = ""
+    for msg in history:
+        if msg.get("role") == "user" and msg.get("content", "").strip():
+            first_prompt = msg["content"].strip()
+            break
+    display_title = title if title else (first_prompt if (prompt_title == "1" or session_title.endswith("…")) and first_prompt else session_title)
+
+    slides = _build_flipbook_slides(history)
     slides_json = json.dumps(slides)
     img_count = len(slides)
+    t = dict(FLIPBOOK_STYLES.get(template, FLIPBOOK_STYLES["cyber"]))  # copy so we can override
+    # Apply custom colors if provided
+    if color_accent:
+        t["strong_color"] = color_accent
+        t["controls_accent"] = color_accent
+    if color_highlight:
+        t["em_color"] = color_highlight
+        if t.get("title_gradient") and t["title_gradient"] != "none":
+            t["title_gradient"] = f"linear-gradient(135deg, {color_highlight}, {color_accent or '#00ffc8'})"
+        t["progress_gradient"] = f"linear-gradient(90deg, {color_highlight}, {color_accent or '#00ffc8'})"
+    if color_bg:
+        t["title_bg"] = color_bg
+        t["body"] = re.sub(r'background:[^;]+', f'background:{color_bg}', t["body"])
+        t["img"] = re.sub(r'background:[^;]+', f'background:{color_bg}', t["img"])
+    if color_text:
+        t["overlay_color"] = color_text
+
+    # Build dynamic CSS
+    kenburns_css = """
+.slide img { animation: kenburns 12s ease-in-out infinite alternate; }
+@keyframes kenburns { 0% { transform:scale(1) translate(0,0); } 100% { transform:scale(1.08) translate(-1%,-1%); } }
+""" if t.get("kenburns") else ""
+
+    scanlines_css = """
+.flipbook::after { content:''; position:fixed; inset:0; pointer-events:none; z-index:50;
+  background:repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.15) 2px, rgba(0,0,0,0.15) 4px); }
+""" if t.get("scanlines") else ""
+
+    title_style = ""
+    if t.get("title_gradient") and t["title_gradient"] != "none":
+        title_style = f"background:{t['title_gradient']}; -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;"
+    else:
+        title_style = f"color:{t.get('title_color', '#fff')}; {t.get('title_shadow', '')}"
+
+    overlay_extra = t.get("overlay_extra", "")
+    fonts = "https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400&family=VT323&family=Bangers&family=Inter:wght@400&display=swap"
+    # Scale fade with speed: fast = instant, slow = smooth crossfade (max 1s)
+    fade_duration = round(min(initial_speed * 0.3, 1.0), 2)
+    overlay_fade_delay = round(min(initial_speed * 0.15, 0.5), 2)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} — Flip Book</title>
+<title>{display_title} &mdash; Flip Book</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400&display=swap');
+@import url('{fonts}');
 * {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ background:#000; overflow:hidden; font-family:'Crimson Pro',Georgia,serif; cursor:none; }}
-body.paused {{ cursor:default; }}
+body {{ {t['body']} overflow:hidden; }}
 .flipbook {{ position:fixed; inset:0; }}
-.slide {{ position:absolute; inset:0; opacity:0; transition:opacity 1.5s ease; }}
+.slide {{ position:absolute; inset:0; opacity:0; transition:opacity {fade_duration}s ease; display:flex; align-items:center; justify-content:center; }}
 .slide.active {{ opacity:1; }}
-.slide img {{
-    width:100%; height:100%; object-fit:cover;
-    animation: kenburns 12s ease-in-out infinite alternate;
-}}
-@keyframes kenburns {{
-    0% {{ transform:scale(1) translate(0,0); }}
-    100% {{ transform:scale(1.08) translate(-1%,-1%); }}
-}}
+.slide img {{ {t['img']} }}
+{kenburns_css}
+{scanlines_css}
 .slide .overlay {{
     position:absolute; bottom:0; left:0; right:0;
-    padding:40px 60px 50px;
-    background:linear-gradient(transparent, rgba(0,0,0,0.85) 40%);
-    color:#e8e8ea;
-    font-size:clamp(0.9rem,2vw,1.3rem);
+    padding:30px 60px 40px;
+    background:{t['overlay_bg']};
+    color:{t['overlay_color']};
+    font-size:clamp(0.85rem,1.5vw,1.1rem);
     line-height:1.7;
-    opacity:0;
-    transform:translateY(10px);
-    transition:opacity 0.8s ease 0.5s, transform 0.8s ease 0.5s;
+    text-align:center;
+    max-height:40vh;
+    overflow-y:auto;
+    opacity:0; transform:translateY(10px);
+    transition:opacity {fade_duration}s ease {overlay_fade_delay}s, transform {fade_duration}s ease {overlay_fade_delay}s;
+    font-style:italic;
+    letter-spacing:0.3px;
+    {overlay_extra}
 }}
-.slide.active .overlay {{
-    opacity:1;
-    transform:translateY(0);
-}}
-.slide .overlay strong {{ color:#00ffc8; }}
-.slide .overlay em {{ color:#c8b4ff; }}
-.controls {{
-    position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
-    display:flex; gap:12px; align-items:center; z-index:100;
-    opacity:0; transition:opacity 0.3s;
-    font-family:'JetBrains Mono',monospace;
-}}
-body.paused .controls, body:hover .controls {{ opacity:1; }}
-.controls button {{
-    background:rgba(0,0,0,0.6); border:1px solid rgba(255,255,255,0.15);
-    color:#ccc; padding:8px 16px; border-radius:20px; cursor:pointer;
-    font-size:13px; font-family:inherit; transition:all 0.2s;
-    backdrop-filter:blur(10px);
-}}
-.controls button:hover {{ border-color:var(--accent,#00ffc8); color:#fff; }}
+.slide .overlay::-webkit-scrollbar {{ width:4px; }}
+.slide .overlay::-webkit-scrollbar-thumb {{ background:rgba(255,255,255,0.2); border-radius:2px; }}
+.slide.active .overlay {{ opacity:1; transform:translateY(0); }}
+.slide .overlay strong {{ color:{t['strong_color']}; font-style:normal; }}
+.slide .overlay em {{ color:{t['em_color']}; }}
 .progress {{
     position:fixed; top:0; left:0; height:3px; z-index:100;
-    background:linear-gradient(90deg,#bd00ff,#00ffc8);
+    background:{t['progress_gradient']};
     transition:width 0.3s ease;
 }}
 .counter {{
@@ -409,19 +526,23 @@ body.paused .controls, body:hover .controls {{ opacity:1; }}
     color:rgba(255,255,255,0.4); letter-spacing:2px;
     opacity:0; transition:opacity 0.3s;
 }}
-body.paused .counter, body:hover .counter {{ opacity:1; }}
+body:hover .counter {{ opacity:1; }}
 .title-card {{
     position:fixed; inset:0; z-index:200;
     display:flex; flex-direction:column; align-items:center; justify-content:center;
-    background:#0a0a0f;
+    background:{t['title_bg']};
     transition:opacity 1s ease;
 }}
 .title-card.hidden {{ opacity:0; pointer-events:none; }}
 .title-card h1 {{
-    font-size:clamp(2.5rem,6vw,5rem); font-weight:600;
-    background:linear-gradient(135deg,#bd00ff,#00ffc8);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-    background-clip:text; margin-bottom:16px; text-align:center; padding:0 20px;
+    font-size:clamp(1.5rem,5vw,4rem); font-weight:600;
+    {title_style}
+    margin-bottom:16px; text-align:center;
+    width:100%; word-wrap:break-word; overflow-wrap:break-word; padding:0 40px;
+}}
+.title-card .subtitle {{
+    font-size:clamp(1rem,2vw,1.4rem); color:#888; font-style:italic;
+    text-align:center; padding:0 40px; margin-bottom:16px; max-width:700px;
 }}
 .title-card .meta {{
     font-family:'JetBrains Mono',monospace; font-size:0.7rem;
@@ -431,32 +552,26 @@ body.paused .counter, body:hover .counter {{ opacity:1; }}
 </head>
 <body>
 <div class="title-card" id="titleCard">
-    <h1>{title}</h1>
-    <div class="meta">LLM Dream 👾 &mdash; {img_count} frames</div>
+    <h1>{display_title}</h1>
+    {"<div class='subtitle'>" + subtitle + "</div>" if subtitle else ""}
+    <div class="meta">LLM Dream &mdash; {img_count} frames</div>
 </div>
 <div class="progress" id="progress"></div>
 <div class="counter" id="counter"></div>
 <div class="flipbook" id="flipbook"></div>
-<div class="controls">
-    <button onclick="prev()">◀</button>
-    <button onclick="togglePause()" id="pauseBtn">⏸</button>
-    <button onclick="next()">▶</button>
-    <button onclick="setSpeed(-1)">−</button>
-    <span id="speedLabel" style="color:#888;font-size:11px;">6s</span>
-    <button onclick="setSpeed(1)">+</button>
-</div>
 <script>
 const slides = {slides_json};
-let current = 0, paused = false, interval = 6000, timer = null;
+const showText = {'true' if hide_text != '1' else 'false'};
+let current = 0, paused = false, interval = {initial_speed * 1000}, timer = null;
 const fb = document.getElementById('flipbook');
 const prog = document.getElementById('progress');
 const counter = document.getElementById('counter');
 
-// Preload all images
 slides.forEach((s,i) => {{
     const div = document.createElement('div');
     div.className = 'slide';
-    div.innerHTML = `<img src="${{s.url}}" alt=""><div class="overlay">${{s.text}}</div>`;
+    const overlay = showText && s.text ? `<div class="overlay">${{s.text}}</div>` : '';
+    div.innerHTML = `<img src="${{s.url}}" alt="">${{overlay}}`;
     fb.appendChild(div);
     const img = new Image();
     img.src = s.url;
@@ -474,16 +589,8 @@ function prev() {{ show((current-1+slides.length) % slides.length); }}
 
 function togglePause() {{
     paused = !paused;
-    document.body.classList.toggle('paused', paused);
-    document.getElementById('pauseBtn').textContent = paused ? '▶' : '⏸';
     if (!paused) startTimer();
     else clearInterval(timer);
-}}
-
-function setSpeed(delta) {{
-    interval = Math.max(2000, Math.min(20000, interval + delta*1000));
-    document.getElementById('speedLabel').textContent = (interval/1000)+'s';
-    if (!paused) startTimer();
 }}
 
 function startTimer() {{
@@ -491,26 +598,104 @@ function startTimer() {{
     timer = setInterval(next, interval);
 }}
 
-// Title card → first slide
 setTimeout(() => {{
     document.getElementById('titleCard').classList.add('hidden');
     if (slides.length) show(0);
     startTimer();
 }}, 3000);
 
-// Keyboard controls
 document.addEventListener('keydown', e => {{
     if (e.key === 'ArrowRight' || e.key === ' ') next();
     else if (e.key === 'ArrowLeft') prev();
     else if (e.key === 'p' || e.key === 'Escape') togglePause();
 }});
 
-// Click to advance
 document.getElementById('flipbook').addEventListener('click', next);
 </script>
 </body>
 </html>"""
     return HTMLResponse(html)
+
+
+@app.get("/prompts/{session_id}")
+async def prompts_export(session_id: str):
+    """Export all prompts/stages from a session as plain text."""
+    session_data, err = _load_session(session_id)
+    if err:
+        return err
+    history = session_data.get("history", [])
+    title = session_data.get("title", "Untitled Story")
+
+    lines = [f"# {title}", f"# Session: {session_id}", ""]
+    for i, msg in enumerate(history):
+        role = msg.get("role", "")
+        name = msg.get("name", role)
+        content = msg.get("content", "").strip()
+        images = msg.get("images", [])
+        if not content and not images:
+            continue
+        lines.append(f"[{name}]")
+        if content:
+            lines.append(content)
+        for img_url in images:
+            lines.append(f"  [image: {img_url}]")
+        lines.append("")
+
+    return PlainTextResponse("\n".join(lines), headers={
+        "Content-Disposition": f'inline; filename="{session_id}-prompts.txt"'
+    })
+
+
+@app.get("/storybook/{session_id}/save")
+async def storybook_save(session_id: str, template: str = Query("cyberpunk"), captions: str = Query(""),
+                         title: str = Query(""), subtitle: str = Query(""), prompt_title: str = Query("")):
+    """Save a storybook as an HTML file in static/exports/ and return the URL."""
+    session_data, err = _load_session(session_id)
+    if err:
+        return err
+    history = session_data.get("history", [])
+    session_title = session_data.get("title", "Untitled Story")
+    show_captions = captions == "1"
+    use_prompt_title = prompt_title == "1"
+
+    story_body, img_count, first_prompt = _build_story_sections(history, captions=show_captions)
+    style = STORYBOOK_STYLES.get(template, STORYBOOK_STYLES["cyberpunk"])
+    display_title = title if title else (first_prompt if use_prompt_title and first_prompt else session_title)
+    subtitle_html = f'<div class="storybook-subtitle">{subtitle}</div>' if subtitle else ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{display_title} &mdash; LLM Dream Storybook</title>
+<style>{style}</style>
+</head>
+<body>
+<header class="storybook-header">
+    <h1 class="storybook-title">{display_title}</h1>
+    {subtitle_html}
+    <div class="storybook-meta">LLM Dream &mdash; {img_count} illustrations</div>
+</header>
+<article class="storybook-content">
+{story_body}
+</article>
+<footer class="storybook-footer">
+    Generated by LLM Dream
+</footer>
+</body>
+</html>"""
+
+    # Save to exports folder
+    safe_title = re.sub(r'[^a-zA-Z0-9_-]', '', title.replace(' ', '-'))[:50]
+    filename = f"storybook-{safe_title}-{session_id[:8]}.html"
+    filepath = os.path.join(EXPORTS_DIR, filename)
+    with open(filepath, "w") as f:
+        f.write(html)
+
+    return HTMLResponse(html, headers={
+        "X-Export-Path": f"/static/exports/{filename}"
+    })
 
 
 async def broadcast(data: dict):
@@ -911,6 +1096,46 @@ async def respond_to_user():
     global auto_chat_active, current_generation_task
     try:
         model_ids = list(ctx.models.keys())
+
+        # Detect multi-stage prompt IMMEDIATELY so schedule pins right away
+        if len(ctx.models) >= 2 and not auto_chat_active:
+            last_user = None
+            for msg in reversed(ctx.history):
+                if msg.get("role") == "user":
+                    last_user = msg.get("content", "")
+                    break
+            if last_user:
+                stages = parse_story_stages(last_user)
+                if stages:
+                    story_stages.clear()
+                    story_stages.extend(stages)
+                    global current_stage, stage_started_at
+                    current_stage = 0
+                    stage_started_at = time.time()
+                    first_stage = stages[0]
+                    director_msg = f"[Stage 1/{len(stages)}] {first_stage}"
+                    ctx.add_message("user", "Director", director_msg)
+                    await broadcast({
+                        "type": "message",
+                        "role": "user",
+                        "name": "Director",
+                        "content": director_msg,
+                    })
+                    await broadcast({
+                        "type": "stage_update",
+                        "current": 1,
+                        "total": len(stages),
+                        "text": first_stage,
+                    })
+                    current_stage = 1
+                    await broadcast({
+                        "type": "stages_schedule",
+                        "stages": stages,
+                        "interval_minutes": stage_interval_minutes,
+                        "current": 1,
+                    })
+                    print(f"[story] Parsed {len(stages)}-stage story from chat. Stage 1: {first_stage[:60]}")
+
         # Show thinking indicators for all models about to respond
         for mid in model_ids:
             cfg = ctx.models.get(mid, {})
@@ -928,39 +1153,6 @@ async def respond_to_user():
 
         # Auto-start auto-chat if 2+ models and not killed
         if len(ctx.models) >= 2 and not kill_event.is_set() and not auto_chat_active:
-            # Check if the user's last message was a multi-stage prompt
-            last_user = None
-            for msg in reversed(ctx.history):
-                if msg.get("role") == "user":
-                    last_user = msg.get("content", "")
-                    break
-            if last_user:
-                stages = parse_story_stages(last_user)
-                if stages:
-                    story_stages.clear()
-                    story_stages.extend(stages)
-                    global current_stage, stage_started_at
-                    current_stage = 0
-                    stage_started_at = time.time()
-                    # Replace the user message with just stage 1
-                    first_stage = stages[0]
-                    director_msg = f"[Stage 1/{len(stages)}] {first_stage}"
-                    ctx.add_message("user", "Director", director_msg)
-                    await broadcast({
-                        "type": "message",
-                        "role": "user",
-                        "name": "Director",
-                        "content": director_msg,
-                    })
-                    await broadcast({
-                        "type": "stage_update",
-                        "current": 1,
-                        "total": len(stages),
-                        "text": first_stage,
-                    })
-                    current_stage = 1
-                    print(f"[story] Parsed {len(stages)}-stage story from chat. Stage 1: {first_stage[:60]}")
-
             auto_chat_active = True
             kill_event.clear()
             current_generation_task = asyncio.create_task(auto_chat_loop())
@@ -1006,9 +1198,30 @@ async def inject_next_stage():
         "total": total,
         "text": stage_text,
     })
-    print(f"[story] Stage {stage_num}/{total}: {stage_text[:60]}")
     current_stage += 1
     stage_started_at = time.time()
+    await broadcast({
+        "type": "stages_schedule",
+        "stages": list(story_stages),
+        "interval_minutes": stage_interval_minutes,
+        "current": stage_num,
+    })
+    print(f"[story] Stage {stage_num}/{total}: {stage_text[:60]}")
+
+    # If this was the last stage and auto-kill-after-last is set, schedule delayed kill
+    if current_stage >= len(story_stages):
+        auto_kill_after = _auto_kill_after_last_minutes
+        if auto_kill_after and auto_kill_after > 0:
+            async def _delayed_kill():
+                await asyncio.sleep(auto_kill_after * 60)
+                if auto_chat_active:
+                    print(f"[stage-builder] Auto-kill after last: {auto_kill_after}min elapsed. Stopping.")
+                    await kill_all()
+            asyncio.create_task(_delayed_kill())
+            await broadcast({"type": "system", "message": f"All stages sent. Auto-stopping in {auto_kill_after} minutes."})
+        else:
+            await broadcast({"type": "system", "message": "All stages sent. Auto-chat continues until killed."})
+
     return True
 
 
@@ -1024,7 +1237,9 @@ async def auto_chat_loop():
         # Check if we should advance to next story stage (time-based)
         if story_stages and current_stage < len(story_stages):
             elapsed = time.time() - stage_started_at
-            if elapsed >= stage_interval_minutes * 60:
+            # Use per-stage interval if available, otherwise global
+            cur_interval = stage_intervals[current_stage] if current_stage < len(stage_intervals) else stage_interval_minutes
+            if elapsed >= cur_interval * 60:
                 await inject_next_stage()
 
         for model_id in model_ids:
@@ -1086,7 +1301,7 @@ async def kill_all():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    global auto_chat_active, current_generation_task, _last_user_msg_time, stage_interval_minutes
+    global auto_chat_active, current_generation_task, _last_user_msg_time, stage_interval_minutes, _auto_kill_after_last_minutes
     await ws.accept()
     connected_clients.append(ws)
 
@@ -1195,12 +1410,6 @@ async def websocket_endpoint(ws: WebSocket):
                     task.add_done_callback(active_tasks.discard)
 
             elif action == "add_model":
-                if len(ctx.models) >= 4:
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Maximum 4 models allowed. Remove one first.",
-                    }))
-                    continue
                 model_id = data["model_id"]
                 display_name = data.get("display_name", model_id)
                 system_prompt = data.get("system_prompt", "")
@@ -1297,6 +1506,12 @@ async def websocket_endpoint(ws: WebSocket):
                             "text": first_stage,
                         })
                         current_stage = 1  # next stage to inject is index 1
+                        await broadcast({
+                            "type": "stages_schedule",
+                            "stages": stages,
+                            "interval_minutes": stage_interval_minutes,
+                            "current": 1,
+                        })
                         print(f"[story] Started {len(stages)}-stage story. Stage 1: {first_stage[:60]}")
                     elif prompt:
                         ctx.add_message("user", "User", prompt)
@@ -1311,6 +1526,53 @@ async def websocket_endpoint(ws: WebSocket):
                     kill_event.clear()
                     current_generation_task = asyncio.create_task(auto_chat_loop())
                     await broadcast({"type": "auto_chat_status", "active": True})
+
+            elif action == "send_stages":
+                # Stage builder — explicit multi-stage schedule
+                stages = data.get("stages", [])
+                interval = max(0.5, float(data.get("interval_minutes", 2)))
+                auto_kill_after = data.get("auto_kill_after_last")  # minutes or None
+
+                if len(stages) < 2:
+                    await ws.send_text(json.dumps({"type": "error", "message": "Need at least 2 stages."}))
+                    continue
+                if auto_chat_active:
+                    await kill_all()
+
+                stage_interval_minutes = interval
+                story_stages.clear()
+                story_stages.extend(stages)
+                stage_intervals.clear()
+                per_intervals = data.get("intervals", [])
+                if per_intervals and len(per_intervals) == len(stages):
+                    stage_intervals.extend([max(0.5, float(x)) for x in per_intervals])
+                else:
+                    stage_intervals.extend([interval] * len(stages))
+                current_stage = 0
+
+                first_stage = stages[0]
+                director_msg = f"[Stage 1/{len(stages)}] {first_stage}"
+                ctx.add_message("user", "Director", director_msg)
+                await broadcast({"type": "message", "role": "user", "name": "Director", "content": director_msg})
+                await broadcast({"type": "stage_update", "current": 1, "total": len(stages), "text": first_stage})
+                current_stage = 1
+                stage_started_at = time.time()  # Start interval timer AFTER Stage 1 is sent
+                await broadcast({
+                    "type": "stages_schedule",
+                    "stages": stages,
+                    "interval_minutes": interval,
+                    "current": 1,
+                    "auto_kill_after_last": auto_kill_after,
+                })
+                print(f"[stage-builder] Started {len(stages)}-stage schedule. Interval: {interval}min. Auto-kill after last: {auto_kill_after}min")
+
+                # Store auto-kill-after-last for use when last stage fires
+                _auto_kill_after_last_minutes = auto_kill_after
+
+                auto_chat_active = True
+                kill_event.clear()
+                current_generation_task = asyncio.create_task(auto_chat_loop())
+                await broadcast({"type": "auto_chat_status", "active": True})
 
             elif action == "auto_chat_stop":
                 auto_chat_active = False
